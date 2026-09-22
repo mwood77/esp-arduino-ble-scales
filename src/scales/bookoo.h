@@ -56,6 +56,7 @@ private:
   };
 
   AdvancedOptions advancedOptions;
+  bool connectionReady = false;
 
   enum class Model : uint8_t {
     BOOKOO_SC,
@@ -76,13 +77,14 @@ private:
   std::vector<uint8_t> dataBuffer;
 
   bool performConnectionHandshake();
-  void subscribeToNotifications();
+  bool subscribeToNotifications();
+  void cleanupConnection();
 
   void checkforAdvancedFeatures();
-  void sendMessage(const uint8_t* payload, size_t length, bool waitResponse = false);
-  void sendEvent(const uint8_t* payload, size_t length);
+  bool sendMessage(const uint8_t* payload, size_t length, bool waitResponse = false);
+  bool sendEvent(const uint8_t* payload, size_t length);
   void sendHeartbeat();
-  void sendNotificationRequest();
+  bool sendNotificationRequest();
   void sendId();
   void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify);
   bool decodeAndHandleNotification();
