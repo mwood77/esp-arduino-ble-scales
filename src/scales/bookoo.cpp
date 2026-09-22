@@ -20,21 +20,47 @@ BookooScales::BookooScales(const DiscoveredDevice& device) : RemoteScales(device
 
 bool BookooScales::connect() {
   if (RemoteScales::clientIsConnected()) {
-    RemoteScales::log("Already connected\n");
-    return true;
+    if (connectionReady) {
+      RemoteScales::log("Already connected\n");
+      return true;
+    }
+
+    RemoteScales::log("BLE link exists without a completed handshake; reconnecting\n");
   }
+
+  // A previous attempt may have left a disconnected client or stale GATT
+  // pointers behind. A raw BLE link is not a usable scale connection until
+  // service discovery, notification subscription and the start request all
+  // succeed.
+  cleanupConnection();
 
   RemoteScales::log("Connecting to %s[%s]\n", RemoteScales::getDeviceName().c_str(), RemoteScales::getDeviceAddress().c_str());
   bool result = RemoteScales::clientConnect();
   if (!result) {
-    RemoteScales::clientCleanup();
+    cleanupConnection();
     return false;
   }
 
   if (!performConnectionHandshake()) {
     return false;
   }
-  subscribeToNotifications();
+
+  if (!subscribeToNotifications()) {
+    RemoteScales::log("Weight notification subscription failed\n");
+    cleanupConnection();
+    return false;
+  }
+
+  // Install the callback before asking the scale to start sending data, so an
+  // immediate first frame cannot be lost between the request and subscription.
+  if (!sendNotificationRequest()) {
+    RemoteScales::log("Notification request failed\n");
+    cleanupConnection();
+    return false;
+  }
+
+  lastHeartbeat = millis();
+  connectionReady = true;
   RemoteScales::setWeight(0.f);
 
   // Disable the scale-side flow-smoothing EMA so consumers see raw per-sample
@@ -48,17 +74,21 @@ bool BookooScales::connect() {
 }
 
 void BookooScales::disconnect() {
-  RemoteScales::clientCleanup();
+  cleanupConnection();
 }
 
 bool BookooScales::isConnected() {
-  return RemoteScales::clientIsConnected();
+  if (!RemoteScales::clientIsConnected()) {
+    connectionReady = false;
+    return false;
+  }
+  return connectionReady;
 }
 
 void BookooScales::update() {
   if (markedForReconnection) {
     RemoteScales::log("Marked for disconnection. Will attempt to reconnect.\n");
-    RemoteScales::clientCleanup();
+    cleanupConnection();
     connect();
     markedForReconnection = false;
   }
@@ -297,31 +327,32 @@ bool BookooScales::performConnectionHandshake() {
     RemoteScales::log("Got Service\n");
   }
   else {
-    clientCleanup();
+    cleanupConnection();
     return false;
   }
 
   weightCharacteristic = service->getCharacteristic(weightCharacteristicUUID);
   commandCharacteristic = service->getCharacteristic(commandCharacteristicUUID);
   if (weightCharacteristic == nullptr || commandCharacteristic == nullptr) {
-    clientCleanup();
+    cleanupConnection();
     return false;
   }
   RemoteScales::log("Got weightCharacteristic and commandCharacteristic\n");
 
-  sendNotificationRequest();
-  RemoteScales::log("Sent notification request\n");
-  lastHeartbeat = millis();
   return true;
 }
 
-void BookooScales::sendNotificationRequest() {
+bool BookooScales::sendNotificationRequest() {
   uint8_t payload[] = { 0, 0, 0, 0, 0, 0 };
-  sendEvent(payload, 6);
+  if (!sendEvent(payload, 6)) {
+    return false;
+  }
   RemoteScales::log("Sent event.\n");
+  RemoteScales::log("Sent notification request\n");
+  return true;
 }
 
-void BookooScales::sendEvent(const uint8_t* payload, size_t length) {
+bool BookooScales::sendEvent(const uint8_t* payload, size_t length) {
   auto bytes = std::make_unique<uint8_t[]>(length + 1);
   bytes[0] = static_cast<uint8_t>(length + 1);
 
@@ -329,7 +360,7 @@ void BookooScales::sendEvent(const uint8_t* payload, size_t length) {
     bytes[i + 1] = payload[i] & 0xFF;
   }
 
-  sendMessage(bytes.get(), length + 1);
+  return sendMessage(bytes.get(), length + 1);
 }
 
 void BookooScales::sendHeartbeat() {
@@ -360,26 +391,36 @@ void BookooScales::sendHeartbeat() {
   RemoteScales::log("Sent heartbeat\n");
 }
 
-void BookooScales::subscribeToNotifications() {
+bool BookooScales::subscribeToNotifications() {
   RemoteScales::log("subscribeToNotifications\n");
+
+  if (weightCharacteristic == nullptr || !weightCharacteristic->canNotify()) {
+    RemoteScales::log("Weight characteristic does not support notifications\n");
+    return false;
+  }
 
   auto callback = [this](NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
     notifyCallback(characteristic, data, length, isNotify);
     };
 
-  if (weightCharacteristic->canNotify()) {
-    RemoteScales::log("Registering callback for weight characteristic\n");
-    weightCharacteristic->subscribe(true, callback);
+  RemoteScales::log("Registering callback for weight characteristic\n");
+  if (!weightCharacteristic->subscribe(true, callback)) {
+    return false;
   }
 
-  if (commandCharacteristic->canNotify()) {
-    RemoteScales::log("Registering callback for command characteristic\n");
-    commandCharacteristic->subscribe(true, callback);
-  }
+  // FF12 is the write-only command path in the published Bookoo protocol.
+  // Subscribing to it is unnecessary and some firmware revisions advertise a
+  // notify property without exposing a CCCD, which causes the long failure
+  // seen as "Callback set, CCCD not found".
+  return true;
 }
 
 // NOTE: the last byte of `payload` is overwritten with the XOR checksum — callers must reserve it.
-void BookooScales::sendMessage(const uint8_t* payload, size_t length, bool waitResponse) {
+bool BookooScales::sendMessage(const uint8_t* payload, size_t length, bool waitResponse) {
+
+  if (commandCharacteristic == nullptr || payload == nullptr || length == 0) {
+    return false;
+  }
 
   auto bytes = std::make_unique<uint8_t[]>(length);
 
@@ -392,5 +433,15 @@ void BookooScales::sendMessage(const uint8_t* payload, size_t length, bool waitR
   }
   bytes[length - 1] = checksum;
 
-  commandCharacteristic->writeValue(bytes.get(), length, waitResponse);
+  return commandCharacteristic->writeValue(bytes.get(), length, waitResponse);
+}
+
+void BookooScales::cleanupConnection() {
+  connectionReady = false;
+  advancedOptions = AdvancedOptions{};
+  dataBuffer.clear();
+  service = nullptr;
+  weightCharacteristic = nullptr;
+  commandCharacteristic = nullptr;
+  RemoteScales::clientCleanup();
 }
